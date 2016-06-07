@@ -24,12 +24,9 @@ type alias ChatMessage =
 type alias Model =
     { newMessage : String
     , messages : List ChatMessage
-    , phxSocket : Phoenix.Socket.Socket Msg
+    , username : String
+    , phxSocket : Maybe (Phoenix.Socket.Socket Msg)
     }
-
-
-
--- We can either set our new message or join our channel
 
 
 type Msg
@@ -38,34 +35,29 @@ type Msg
     | PhoenixMsg (Phoenix.Socket.Msg Msg)
     | SendMessage
     | ReceiveChatMessage JE.Value
-
-
-
--- Basic initial model is straightforward
+    | SetUsername String
+    | ConnectSocket
 
 
 initialModel : Model
 initialModel =
     { newMessage = ""
     , messages = []
-    , phxSocket = initPhxSocket
+    , username = ""
+    , phxSocket = Nothing
     }
 
 
-socketServer : String
-socketServer =
-    "ws://localhost:4000/socket/websocket"
+socketServer : String -> String
+socketServer username =
+    "ws://localhost:4000/socket/websocket?username=" ++ username
 
 
-initPhxSocket : Phoenix.Socket.Socket Msg
-initPhxSocket =
-    Phoenix.Socket.init socketServer
+initPhxSocket : String -> Phoenix.Socket.Socket Msg
+initPhxSocket username =
+    Phoenix.Socket.init (socketServer username)
         |> Phoenix.Socket.withDebug
         |> Phoenix.Socket.on "new:msg" "room:lobby" ReceiveChatMessage
-
-
-
--- We'll handle either setting the new message or joining the channel.
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -75,52 +67,73 @@ update msg model =
             { model | newMessage = string } ! []
 
         JoinChannel ->
-            let
-                channel =
-                    Phoenix.Channel.init "room:lobby"
+            case model.phxSocket of
+                Nothing ->
+                    model ! []
 
-                ( phxSocket, phxCmd ) =
-                    Phoenix.Socket.join channel model.phxSocket
-            in
-                ( { model | phxSocket = phxSocket }
-                , Cmd.map PhoenixMsg phxCmd
-                )
+                Just modelPhxSocket ->
+                    let
+                        channel =
+                            Phoenix.Channel.init "room:lobby"
+
+                        ( phxSocket, phxCmd ) =
+                            Phoenix.Socket.join channel modelPhxSocket
+                    in
+                        ( { model | phxSocket = Just phxSocket }
+                        , Cmd.map PhoenixMsg phxCmd
+                        )
 
         PhoenixMsg msg ->
-            let
-                ( phxSocket, phxCmd ) =
-                    Phoenix.Socket.update msg model.phxSocket
-            in
-                ( { model | phxSocket = phxSocket }
-                , Cmd.map PhoenixMsg phxCmd
-                )
+            case model.phxSocket of
+                Nothing ->
+                    model ! []
+
+                Just modelPhxSocket ->
+                    let
+                        ( phxSocket, phxCmd ) =
+                            Phoenix.Socket.update msg modelPhxSocket
+                    in
+                        ( { model | phxSocket = Just phxSocket }
+                        , Cmd.map PhoenixMsg phxCmd
+                        )
 
         SendMessage ->
-            let
-                payload =
-                    (JE.object [ ( "body", JE.string model.newMessage ) ])
+            case model.phxSocket of
+                Nothing ->
+                    model ! []
 
-                push' =
-                    Phoenix.Push.init "new:msg" "room:lobby"
-                        |> Phoenix.Push.withPayload payload
+                Just modelPhxSocket ->
+                    let
+                        payload =
+                            (JE.object [ ( "body", JE.string model.newMessage ) ])
 
-                ( phxSocket, phxCmd ) =
-                    Phoenix.Socket.push push' model.phxSocket
-            in
-                ( { model
-                    | newMessage = ""
-                    , phxSocket = phxSocket
-                  }
-                , Cmd.map PhoenixMsg phxCmd
-                )
+                        push' =
+                            Phoenix.Push.init "new:msg" "room:lobby"
+                                |> Phoenix.Push.withPayload payload
+
+                        ( phxSocket, phxCmd ) =
+                            Phoenix.Socket.push push' modelPhxSocket
+                    in
+                        ( { model
+                            | newMessage = ""
+                            , phxSocket = Just phxSocket
+                          }
+                        , Cmd.map PhoenixMsg phxCmd
+                        )
 
         ReceiveChatMessage raw ->
             case JD.decodeValue chatMessageDecoder raw of
                 Ok chatMessage ->
-                    { model | messages = chatMessage :: model.messages } ! []
+                    { model | messages = model.messages ++ [ chatMessage ] } ! []
 
                 Err error ->
                     model ! []
+
+        SetUsername username ->
+            { model | username = username } ! []
+
+        ConnectSocket ->
+            { model | phxSocket = Just (initPhxSocket model.username) } ! []
 
 
 chatMessageDecoder : JD.Decoder ChatMessage
@@ -142,26 +155,46 @@ viewMessage message =
         ]
 
 
+lobbyManagementView : Html Msg
+lobbyManagementView =
+    button [ onClick JoinChannel ] [ text "Join lobby" ]
 
--- Our view will consist of a button to join the lobby, a list of messages, and
--- our text input for crafting our message
+
+messageListView : Model -> Html Msg
+messageListView model =
+    div [ class "messages" ]
+        (List.map viewMessage model.messages)
+
+
+messageInputView : Model -> Html Msg
+messageInputView model =
+    form [ onSubmit SendMessage ]
+        [ input [ placeholder "Message...", onInput SetNewMessage, value model.newMessage ] [] ]
+
+
+chatInterfaceView : Model -> Html Msg
+chatInterfaceView model =
+    div []
+        [ lobbyManagementView
+        , messageListView model
+        , messageInputView model
+        ]
+
+
+setUsernameView : Html Msg
+setUsernameView =
+    form [ onSubmit ConnectSocket ]
+        [ input [ onInput SetUsername, placeholder "Enter a username" ] [] ]
 
 
 view : Model -> Html Msg
 view model =
-    div []
-        -- Clicking the button joins the lobby channel
-        [ button [ onClick JoinChannel ] [ text "Join lobby" ]
-        , div [ class "messages" ]
-            (List.map viewMessage model.messages)
-          -- On input, we'll SetNewMessage
-        , form [ onSubmit SendMessage ]
-            [ input [ placeholder "Message...", onInput SetNewMessage, value model.newMessage ] [] ]
-        ]
+    case model.phxSocket of
+        Nothing ->
+            setUsernameView
 
-
-
--- Wire together the program
+        _ ->
+            chatInterfaceView model
 
 
 main : Program Never
@@ -174,17 +207,14 @@ main =
         }
 
 
-
--- No subscriptions yet
-
-
 subscriptions : Model -> Sub Msg
 subscriptions model =
-    Phoenix.Socket.listen model.phxSocket PhoenixMsg
+    case model.phxSocket of
+        Nothing ->
+            Sub.none
 
-
-
--- And here's our init function
+        Just phxSocket ->
+            Phoenix.Socket.listen phxSocket PhoenixMsg
 
 
 init : ( Model, Cmd Msg )
